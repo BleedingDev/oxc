@@ -1,0 +1,10 @@
+{
+  "assumptions": {
+    "setPublicClassFields": true
+  },
+  "plugins": [
+    "transform-class-properties",
+    "transform-legacy-decorator",
+    "transform-typescript"
+  ]
+}

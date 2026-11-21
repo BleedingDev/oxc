@@ -99,6 +99,27 @@ impl<'a> TypeScript<'a> {
     /// we don't need extra transformation for static properties, the output is the same as instance properties
     /// transformation, and the greatest advantage is we don't need to care about `this` usage in static block.
     ///
+    /// Legacy decorators lower decorated fields on class exit, so a decorated field keeps its
+    /// declaration (without its initializer) and its computed key. A decorated static field keeps
+    /// its declaration in front of the new static block:
+    ///
+    /// Input:
+    /// ```ts
+    /// class C {
+    ///   @dec static x = 1;
+    /// }
+    /// ```
+    ///
+    /// Output:
+    /// ```js
+    /// class C {
+    ///   @dec static x;
+    ///   static {
+    ///     this.x = 1;
+    ///   }
+    /// }
+    /// ```
+    ///
     /// Fields that `lowering` keeps for a downstream transform stay as written, and so do instance
     /// fields before [`ClassLowering::first_movable_instance_field`].
     pub(super) fn transform_class_fields(
@@ -123,9 +144,13 @@ impl<'a> TypeScript<'a> {
         // not the current traversal scope (which is the scope enclosing the class).
         let class_scope_id = class.scope_id();
 
-        let mut constructor = None;
+        let mut constructor_index = None;
         let mut property_assignments = Vec::new();
         let mut computed_key_assignments = Vec::new();
+        // Indices of decorated static fields with an initializer, in index order, and the static
+        // block to insert after each of them.
+        let mut decorated_static_field_indices = Vec::new();
+        let mut decorated_static_field_blocks = Vec::new();
         for (index, element) in class.body.body.iter_mut().enumerate() {
             let kept = lowering.keeps_field(element);
             match element {
@@ -137,14 +162,21 @@ impl<'a> TypeScript<'a> {
                         && (!prop.key.is_private_identifier()
                             || (!prop.r#static && will_hoist_initializers_to_constructor)) =>
                 {
+                    // Legacy decorators lower decorated fields on class exit, so a decorated
+                    // field declaration must stay in the class body with its key.
+                    // TODO: Unlike TypeScript, a decorated field whose computed key needs a temp
+                    // var keeps its declaration even when `remove_class_fields_without_initializer`
+                    // is `true`, with or without an initializer, because legacy decorators need
+                    // the key in the class body. e.g. `@dec static [f()];` -> `static [_ref = f()];`
+                    let decorated = !prop.decorators.is_empty();
                     if let Some(value) = prop.value.take() {
-                        // A static property is replaced by a static block below, and an instance
-                        // property is removed later when `remove_class_fields_without_initializer`
-                        // is `true`. Otherwise, the instance property declaration stays in the
-                        // class body (without its initializer), so its key is still evaluated
-                        // during class definition.
-                        let keep_declaration =
-                            !prop.r#static && !self.remove_class_fields_without_initializer;
+                        // An undecorated static property is replaced by a static block below, and
+                        // an undecorated instance property is removed later when
+                        // `remove_class_fields_without_initializer` is `true`. Otherwise, the
+                        // property declaration stays in the class body (without its initializer),
+                        // so its key is still evaluated during class definition.
+                        let keep_declaration = decorated
+                            || (!prop.r#static && !self.remove_class_fields_without_initializer);
                         let assignment = self.convert_property_definition(
                             &mut prop.key,
                             value,
@@ -157,11 +189,22 @@ impl<'a> TypeScript<'a> {
                             // `class C { static x = 1; }` -> `class C { static { this.x = 1; } }`
                             // `class C { static [x] = 1; }` -> `let _x; class C { static { this[_x] = 1; } }`
                             let body = ArenaVec::from_value_in(assignment, ctx);
-                            *element = Self::create_class_static_block(body, class_scope_id, ctx);
+                            let block = Self::create_class_static_block(body, class_scope_id, ctx);
+                            if decorated {
+                                // Keep the declaration in front of the static block, so that
+                                // it doesn't overwrite the assigned value when it is not removed.
+                                // `class C { @dec static x = 1; }` -> `class C { @dec static x; static { this.x = 1; } }`
+                                decorated_static_field_indices.push(index);
+                                decorated_static_field_blocks.push(block);
+                            } else {
+                                *element = block;
+                            }
                         } else {
                             property_assignments.push(assignment);
                         }
                     } else if self.remove_class_fields_without_initializer
+                        // A decorated field keeps its key for legacy decorators (see the `TODO` above).
+                        && !decorated
                         && let Some(key) = prop.key.as_expression_mut()
                     {
                         // `TypeScript` uses `isSimpleInlineableExpression` to check if the key needs to be kept.
@@ -187,7 +230,7 @@ impl<'a> TypeScript<'a> {
                 }
                 ClassElement::MethodDefinition(method) => {
                     if method.kind == MethodDefinitionKind::Constructor {
-                        constructor = Some(&mut method.value);
+                        constructor_index = Some(index);
                     } else if method.key.is_computed() {
                         // A non-computed key (e.g. `"m"() {}`) has no side effects, and can't hold
                         // a sequence expression. Pending assignments go to the next computed key
@@ -215,6 +258,24 @@ impl<'a> TypeScript<'a> {
                 _ => (),
             }
         }
+
+        if !decorated_static_field_indices.is_empty() {
+            Self::insert_decorated_static_field_blocks(
+                &mut class.body.body,
+                &decorated_static_field_indices,
+                decorated_static_field_blocks,
+            );
+            // Each block inserted before the constructor moves it one place.
+            if let Some(index) = &mut constructor_index {
+                *index += decorated_static_field_indices.partition_point(|&field| field < *index);
+            }
+        }
+        let constructor = constructor_index.map(|index| {
+            let ClassElement::MethodDefinition(method) = &mut class.body.body[index] else {
+                unreachable!()
+            };
+            &mut method.value
+        });
 
         let computed_key_assignment_static_block =
             (!computed_key_assignments.is_empty()).then(|| {
@@ -283,6 +344,32 @@ impl<'a> TypeScript<'a> {
             }
         } else if let Some(element) = computed_key_assignment_static_block {
             class.body.body.insert(0, element);
+        }
+    }
+
+    /// Insert each static block in `blocks` after the field at the matching index in
+    /// `field_indices`, which must be in ascending order.
+    ///
+    /// The blocks are appended to `elements`, so its buffer grows at most once, and then rotated
+    /// into place from the back. Each element moves once, and each block moves at most once per
+    /// block after it, so this is `O(n + k^2)` for `n` elements and `k` blocks, with no other
+    /// allocation.
+    fn insert_decorated_static_field_blocks(
+        elements: &mut ArenaVec<'a, ClassElement<'a>>,
+        field_indices: &[usize],
+        blocks: Vec<ClassElement<'a>>,
+    ) {
+        debug_assert_eq!(field_indices.len(), blocks.len());
+        debug_assert!(field_indices.is_sorted());
+        // `[e_0, .., e_{n-1}, b_0, .., b_{k-1}]`
+        let mut end = elements.len();
+        elements.extend(blocks);
+        for (block_index, &field_index) in field_indices.iter().enumerate().rev() {
+            // `[.., e_field, e_field+1, .., e_end-1, b_0, .., b_block, <placed>]`
+            // -> `[.., e_field, b_0, .., b_block, e_field+1, .., e_end-1, <placed>]`
+            let start = field_index + 1;
+            elements[start..=end + block_index].rotate_left(end - start);
+            end = start;
         }
     }
 

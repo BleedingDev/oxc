@@ -1,6 +1,6 @@
 commit: 16a2d671
 
-Passed: 348/473
+Passed: 354/480
 
 # All Passed:
 * babel-plugin-transform-class-static-block
@@ -35,7 +35,7 @@ after transform: SymbolId(1) "C"
 rebuilt        : SymbolId(3) "C"
 
 
-# babel-plugin-transform-class-properties (37/41)
+# babel-plugin-transform-class-properties (42/46)
 * private-field-resolve-to-method/input.js
 x Output mismatch
 
@@ -49,7 +49,7 @@ x Output mismatch
 x Output mismatch
 
 
-# babel-plugin-transform-typescript (56/72)
+# babel-plugin-transform-typescript (57/73)
 * computed-constant-value/input.ts
 x Output mismatch
 
@@ -206,7 +206,7 @@ x Output mismatch
 x Output mismatch
 
 
-# legacy-decorators (24/110)
+# legacy-decorators (24/111)
 * oxc/accessor/input.ts
 x Output mismatch
 
@@ -255,6 +255,11 @@ rebuilt        : <None>
 Unresolved references mismatch:
 after transform: ["WeakMap", "babelHelpers"]
 rebuilt        : ["WeakMap", "a", "babelHelpers", "dec"]
+
+* oxc/class-without-name-with-decorated-param/input.ts
+Symbol flags mismatch for "_default":
+after transform: SymbolId(2): SymbolFlags(Class)
+rebuilt        : SymbolId(0): SymbolFlags(BlockScopedVariable)
 
 * oxc/class-without-name-with-decorated_class/input.ts
 Symbol flags mismatch for "_default":

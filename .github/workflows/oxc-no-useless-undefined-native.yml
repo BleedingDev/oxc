@@ -1,0 +1,216 @@
+name: Fork-only no-useless-undefined native checks
+
+# Temporary fork-only CI. Do not include this file in the upstream PR.
+# Audited against oxc-project/oxc@a96e2bdf600481ef009bd8297bc4da0b419bb130.
+on:
+  push:
+    branches: [ci/no-useless-undefined-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-no-useless-undefined-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  INSTA_REQUIRE_FULL_MATCH: 1
+  INSTA_UPDATE: "no"
+  CARGO_BUILD_WARNINGS: deny
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native:
+    if: >-
+      ${{ github.repository == 'BleedingDev/oxc'
+      && github.event.repository.fork == true
+      && github.ref == 'refs/heads/ci/no-useless-undefined-validation' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      EVIDENCE_DIR: /tmp/oxc-undefined-evidence
+    steps:
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+
+      - name: Record checkout and input hashes
+        run: |
+          mkdir -p "$EVIDENCE_DIR/logs"
+          {
+            printf 'audited_base=a96e2bdf600481ef009bd8297bc4da0b419bb130\n'
+            printf 'repository=%s\nref=%s\nsha=%s\nrun_id=%s\nattempt=%s\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            git rev-parse HEAD
+            cat rust-toolchain.toml .node-version
+            df -h .
+          } 2>&1 | tee "$EVIDENCE_DIR/logs/checkout.log"
+          sha256sum crates/oxc_linter/src/rules/unicorn/no_useless_undefined.rs \
+            Cargo.lock pnpm-lock.yaml apps/oxlint/scripts/generate-config-types.ts \
+            > "$EVIDENCE_DIR/input-sha256.txt"
+
+      # Upstream autofix's minimal Rust setup and restore-only cache.
+      # No cargo-shear: it can modify dependencies. No Namespace/private runner.
+      - uses: oxc-project/setup-rust@3d6fb132fbe7cdcb66bf8ec193911c2945369d12 # v1.0.17
+        id: rust
+        with:
+          components: clippy rustfmt
+          tools: just
+          restore-cache: true
+          save-cache: false
+          cache-key: no-useless-undefined-native
+
+      # Reads .node-version and packageManager. Installs frozen dependencies
+      # with --ignore-scripts. On this non-default branch it does not save cache.
+      - uses: oxc-project/setup-node@f46a72f95efdc55273fcd042d61c84e723b2892c # v1.4.1
+        id: node
+
+      - name: Record installed tools
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' && steps.node.outcome == 'success' }}
+        run: |
+          {
+            rustc --version
+            cargo --version
+            cargo clippy --version
+            rustfmt --version
+            just --version
+            node --version
+            pnpm --version
+          } 2>&1 | tee "$EVIDENCE_DIR/logs/toolchain.log"
+
+      - name: Check changed Rust file formatting
+        id: rustfmt
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          rustfmt --edition 2024 --check \
+            crates/oxc_linter/src/rules/unicorn/no_useless_undefined.rs \
+            2>&1 | tee "$EVIDENCE_DIR/logs/rustfmt.log"
+
+      - name: Generate linter schema JSON
+        id: schema
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          # just linter-schema-json, with --locked added to prohibit lockfile updates.
+          if cargo run --locked -p website_linter -- schema-json \
+            > "$RUNNER_TEMP/no-useless-undefined-schema.json" \
+            2> "$EVIDENCE_DIR/logs/linter-schema-json.log"; then
+            cat "$EVIDENCE_DIR/logs/linter-schema-json.log"
+          else
+            status=$?
+            cat "$EVIDENCE_DIR/logs/linter-schema-json.log"
+            exit "$status"
+          fi
+          cp "$RUNNER_TEMP/no-useless-undefined-schema.json" npm/oxlint/configuration_schema.json
+          cp --parents npm/oxlint/configuration_schema.json "$EVIDENCE_DIR/"
+
+      - name: Generate linter config TypeScript
+        id: types
+        if: >-
+          ${{ !cancelled() && steps.rust.outcome == 'success'
+          && steps.node.outcome == 'success' && steps.schema.outcome == 'success' }}
+        run: |
+          just linter-config-ts 2>&1 | tee "$EVIDENCE_DIR/logs/linter-config-ts.log"
+          cp --parents apps/oxlint/src-js/package/config.generated.ts "$EVIDENCE_DIR/"
+
+      # The owning guide requires these unfiltered, package-scoped checks.
+      # just lint expands to cargo clippy --all-targets --all-features.
+      - name: Lint all oxc_linter targets and features
+        id: lint
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          just lint --locked -p oxc_linter 2>&1 | tee "$EVIDENCE_DIR/logs/lint-oxc_linter.log"
+
+      # just test expands to cargo test --all-features, including integration
+      # tests and doctests for this package. There is no test-name filter.
+      - name: Test oxc_linter without a filter
+        id: tests
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: |
+          just test --locked -p oxc_linter 2>&1 | tee "$EVIDENCE_DIR/logs/test-oxc_linter.log"
+          grep -Fq 'test rules::unicorn::no_useless_undefined::test_check_return_value ... ok' \
+            "$EVIDENCE_DIR/logs/test-oxc_linter.log"
+          grep -Fq 'test rules::unicorn::no_useless_undefined::test_check_return_value_option_interactions ... ok' \
+            "$EVIDENCE_DIR/logs/test-oxc_linter.log"
+
+      - name: Test native schema consistency
+        id: schema_test
+        if: ${{ !cancelled() && steps.schema.outcome == 'success' }}
+        run: |
+          cargo test --locked -p website_linter --bin website_linter \
+            json_schema::test_schema_json -- --exact --nocapture \
+            2>&1 | tee "$EVIDENCE_DIR/logs/schema-consistency.log"
+          grep -Fxq 'running 1 test' "$EVIDENCE_DIR/logs/schema-consistency.log"
+
+      - name: Check generated option and unchanged dependencies
+        id: validate
+        if: ${{ !cancelled() && steps.types.outcome == 'success' }}
+        run: |
+          {
+            python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          schema = json.loads(Path("npm/oxlint/configuration_schema.json").read_text())
+          config = schema["definitions"]["NoUselessUndefined"]
+          option = config["properties"]["checkReturnValue"]
+          assert option["type"] == "boolean", option
+          assert option["default"] is True, option
+          assert "checkReturnValue" not in config.get("required", [])
+          assert config["additionalProperties"] is False
+          types = Path("apps/oxlint/src-js/package/config.generated.ts").read_text()
+          body = re.search(r"export interface NoUselessUndefined \{([^}]*)\}", types)
+          assert body and re.search(r"\bcheckReturnValue\?: boolean;", body[1])
+          print("Generated checkReturnValue is optional, boolean, and default-true.")
+          PY
+            git diff --exit-code -- . \
+              ':(exclude)npm/oxlint/configuration_schema.json' \
+              ':(exclude)apps/oxlint/src-js/package/config.generated.ts'
+          } 2>&1 | tee "$EVIDENCE_DIR/logs/generated-validation.log"
+
+      - name: Collect evidence even on check failure
+        if: ${{ always() }}
+        env:
+          RUST_OUTCOME: ${{ steps.rust.outcome }}
+          NODE_OUTCOME: ${{ steps.node.outcome }}
+          FORMAT_OUTCOME: ${{ steps.rustfmt.outcome }}
+          SCHEMA_OUTCOME: ${{ steps.schema.outcome }}
+          TYPES_OUTCOME: ${{ steps.types.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+          SCHEMA_TEST_OUTCOME: ${{ steps.schema_test.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+        run: |
+          mkdir -p "$EVIDENCE_DIR/logs"
+          {
+            printf 'rust=%s\nnode=%s\nrustfmt=%s\nschema=%s\ntypes=%s\nlint=%s\ntests=%s\nschema_test=%s\nvalidate=%s\n' \
+              "$RUST_OUTCOME" "$NODE_OUTCOME" "$FORMAT_OUTCOME" "$SCHEMA_OUTCOME" \
+              "$TYPES_OUTCOME" "$LINT_OUTCOME" "$TEST_OUTCOME" "$SCHEMA_TEST_OUTCOME" "$VALIDATE_OUTCOME"
+          } > "$EVIDENCE_DIR/outcomes.txt"
+          git diff --binary -- npm/oxlint/configuration_schema.json \
+            apps/oxlint/src-js/package/config.generated.ts > "$EVIDENCE_DIR/generated.patch"
+          {
+            git status --short
+            df -h .
+            du -sh target "$HOME/.rustup" "$HOME/.cargo" node_modules || true
+          } 2>&1 | tee "$EVIDENCE_DIR/logs/final-state-and-disk.log"
+          (
+            cd "$EVIDENCE_DIR"
+            find . -type f ! -name artifact-sha256.txt -print0 \
+              | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/oxc-undefined-artifact-sha256.txt"
+            mv "$RUNNER_TEMP/oxc-undefined-artifact-sha256.txt" artifact-sha256.txt
+          )
+
+      - name: Upload generated files and full command logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: no-useless-undefined-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ env.EVIDENCE_DIR }}/
+          if-no-files-found: error
+          retention-days: 7
